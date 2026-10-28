@@ -1,0 +1,15 @@
+config netcontrol 'main'
+	option enabled '1'
+
+# 示例设备：复制本段并修改 MAC/IP；默认禁用，避免安装后意外断网。
+config device 'example_phone'
+	option name '示例手机（请修改）'
+	option enabled '0'
+	option mac 'AA:BB:CC:DD:EE:FF'
+	option ip '192.168.1.123'
+	option start '07:00'
+	option finish '21:30'
+	option work_min '45'
+	option rest_min '15'
+	option download_kbit '5000'
+	option upload_kbit '1000'

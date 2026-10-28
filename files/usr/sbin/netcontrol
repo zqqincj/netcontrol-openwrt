@@ -1,0 +1,215 @@
+#!/bin/sh
+# NetControl 0.1.0 - OpenWrt 25.12 / fw4 / nftables
+# Only manages its own inet netcontrol table and explicitly-marked tc qdiscs.
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+CFG=netcontrol
+STATE_DIR=/etc/netcontrol/state
+RATE_SIG=/etc/netcontrol/rate.sig
+LAN_DEV="$(uci -q get network.lan.device 2>/dev/null)"
+[ -n "$LAN_DEV" ] || LAN_DEV="$(uci -q get network.lan.ifname 2>/dev/null)"
+[ -n "$LAN_DEV" ] || LAN_DEV=br-lan
+IFB=ifb-netcontrol
+
+log() { logger -t netcontrol "$*"; }
+valid_time() { echo "$1" | grep -Eq '^[0-2][0-9]:[0-5][0-9]$' && [ "${1%:*}" -le 23 ]; }
+valid_mac() { echo "$1" | grep -Eiq '^([0-9a-f]{2}:){5}[0-9a-f]{2}$'; }
+valid_ip() { echo "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; }
+
+sections() { uci -q show "$CFG" | sed -n 's/^netcontrol\.\([^.=]*\)=device$/\1/p'; }
+
+is_in_window() {
+    _now="$1"; _start="$2"; _finish="$3"
+    _now=$((_now + 0)); _start=$((_start + 0)); _finish=$((_finish + 0))
+    if [ "$_start" -le "$_finish" ]; then
+        [ "$_now" -ge "$_start" ] && [ "$_now" -lt "$_finish" ]
+    else
+        [ "$_now" -ge "$_start" ] || [ "$_now" -lt "$_finish" ]
+    fi
+}
+
+blocked_now() {
+    _sec="$1"
+    _en="$(uci -q get "$CFG.$_sec.enabled")"
+    [ "$_en" = 1 ] || return 1
+    _mac="$(uci -q get "$CFG.$_sec.mac")"
+    valid_mac "$_mac" || return 1
+    _start="$(uci -q get "$CFG.$_sec.start")"; _finish="$(uci -q get "$CFG.$_sec.finish")"
+    valid_time "$_start" && valid_time "$_finish" || return 1
+    _now="$(date +%H%M)"
+    _a="$(echo "$_start" | tr -d :)"; _b="$(echo "$_finish" | tr -d :)"
+    _now_n="$(echo "$_now" | sed 's/^0*//')"; _a_n="$(echo "$_a" | sed 's/^0*//')"; _b_n="$(echo "$_b" | sed 's/^0*//')"
+    [ -n "$_now_n" ] || _now_n=0; [ -n "$_a_n" ] || _a_n=0; [ -n "$_b_n" ] || _b_n=0
+    is_in_window "$_now_n" "$_a_n" "$_b_n" || return 0
+
+    _work="$(uci -q get "$CFG.$_sec.work_min")"; _rest="$(uci -q get "$CFG.$_sec.rest_min")"
+    case "$_work:$_rest" in *[!0-9:]*|:*) _work=0; _rest=0;; esac
+    [ -n "$_work" ] || _work=0; [ -n "$_rest" ] || _rest=0
+    [ "$_work" -gt 0 ] 2>/dev/null || return 1
+    [ "$_rest" -gt 0 ] 2>/dev/null || return 1
+    mkdir -p "$STATE_DIR"
+    _state="$STATE_DIR/$_sec"
+    _nowepoch="$(date +%s)"
+    _saved="$(cat "$_state" 2>/dev/null)"
+    _anchor="${_saved%%:*}"; _tail="${_saved#*:}"
+    if ! echo "$_anchor" | grep -Eq '^[0-9]+$' || [ "$_tail" != "$_work:$_rest" ]; then
+        _anchor="$_nowepoch"
+        printf '%s:%s:%s\n' "$_anchor" "$_work" "$_rest" > "$_state"
+    fi
+    _cycle=$((_work + _rest))
+    _elapsed=$((_nowepoch - _anchor))
+    [ "$_elapsed" -ge 0 ] || _elapsed=0
+    _phase=$((_elapsed / 60 % _cycle))
+    [ "$_phase" -ge "$_work" ]
+}
+
+firewall_apply() {
+    nft list table inet netcontrol >/dev/null 2>&1 || nft add table inet netcontrol || return 1
+    nft list chain inet netcontrol forward >/dev/null 2>&1 || nft 'add chain inet netcontrol forward { type filter hook forward priority -5; policy accept; }' || return 1
+    _batch=/tmp/netcontrol.nft
+    {
+        echo 'flush chain inet netcontrol forward'
+        for sec in $(sections); do
+            if blocked_now "$sec"; then
+                mac="$(uci -q get "$CFG.$sec.mac")"
+                if valid_mac "$mac"; then
+                    echo "add rule inet netcontrol forward ether saddr $mac counter drop"
+                fi
+            fi
+        done
+    } > "$_batch"
+    nft -f "$_batch" || { log 'nftables 规则应用失败'; return 1; }
+}
+rate_signature() {
+    {
+        echo "$LAN_DEV"
+        for sec in $(sections); do
+            [ "$(uci -q get "$CFG.$sec.enabled")" = 1 ] || continue
+            echo "$sec|$(uci -q get "$CFG.$sec.ip")|$(uci -q get "$CFG.$sec.download_kbit")|$(uci -q get "$CFG.$sec.upload_kbit")"
+        done
+    } | cksum | awk '{print $1":"$2}'
+}
+
+cleanup_rates() {
+    if [ -f /etc/netcontrol/owns_lan_root ]; then
+        if tc qdisc show dev "$LAN_DEV" 2>/dev/null | grep -q 'qdisc htb 1: root'; then
+            tc qdisc del dev "$LAN_DEV" root 2>/dev/null
+        fi
+        rm -f /etc/netcontrol/owns_lan_root
+    fi
+    if [ -f /etc/netcontrol/owns_ingress ]; then
+        tc filter del dev "$LAN_DEV" parent ffff: protocol all 2>/dev/null
+        tc qdisc del dev "$LAN_DEV" ingress 2>/dev/null
+        rm -f /etc/netcontrol/owns_ingress
+    fi
+    if ip link show "$IFB" >/dev/null 2>&1; then
+        ip link set "$IFB" down 2>/dev/null
+        ip link delete "$IFB" type ifb 2>/dev/null
+    fi
+    rm -f /etc/netcontrol/owns_ifb /etc/netcontrol/owns_ifb_root "$RATE_SIG"
+}
+
+rate_apply() {
+    command -v tc >/dev/null 2>&1 || { log 'tc 未安装，跳过限速'; return 0; }
+    command -v ip >/dev/null 2>&1 || { log 'ip 未安装，跳过限速'; return 0; }
+    _sig="$(rate_signature)"
+    [ -f "$RATE_SIG" ] && [ "$(cat "$RATE_SIG")" = "$_sig" ] && return 0
+
+    # Do not touch an existing SQM/QoS root qdisc unless it is ours.
+    if [ ! -f /etc/netcontrol/owns_lan_root ]; then
+        _root="$(tc qdisc show dev "$LAN_DEV" 2>/dev/null | grep ' root' | head -n1)"
+        case "$_root" in
+            *'qdisc noqueue '*|"")
+                if tc qdisc replace dev "$LAN_DEV" root handle 1: htb default 999 2>/dev/null; then
+                    touch /etc/netcontrol/owns_lan_root
+                else
+                    log "无法建立下载限速队列，保留现有队列：$_root"
+                fi ;;
+            *) log "检测到 $LAN_DEV 已有 root qdisc，出于安全不覆盖；下载限速跳过：$_root" ;;
+        esac
+    fi
+
+    if [ -f /etc/netcontrol/owns_lan_root ]; then
+        tc qdisc replace dev "$LAN_DEV" root handle 1: htb default 999 2>/dev/null
+        tc class replace dev "$LAN_DEV" parent 1: classid 1:1 htb rate 1000mbit ceil 1000mbit 2>/dev/null
+        tc class replace dev "$LAN_DEV" parent 1:1 classid 1:999 htb rate 1000mbit ceil 1000mbit 2>/dev/null
+    fi
+
+    # IFB is dedicated to NetControl. Do not take over an existing ingress qdisc.
+    _ingress="$(tc qdisc show dev "$LAN_DEV" 2>/dev/null | grep ' ingress' | head -n1)"
+    if [ -z "$_ingress" ] || [ -f /etc/netcontrol/owns_ingress ]; then
+        if ! ip link show "$IFB" >/dev/null 2>&1; then
+            ip link add "$IFB" type ifb 2>/dev/null && touch /etc/netcontrol/owns_ifb
+        fi
+        if ip link show "$IFB" >/dev/null 2>&1; then
+            ip link set "$IFB" up 2>/dev/null
+            tc qdisc replace dev "$IFB" root handle 2: htb default 999 2>/dev/null
+            tc class replace dev "$IFB" parent 2: classid 2:1 htb rate 1000mbit ceil 1000mbit 2>/dev/null
+            tc class replace dev "$IFB" parent 2:1 classid 2:999 htb rate 1000mbit ceil 1000mbit 2>/dev/null
+            if [ ! -f /etc/netcontrol/owns_ingress ]; then
+                tc qdisc add dev "$LAN_DEV" handle ffff: ingress 2>/dev/null && touch /etc/netcontrol/owns_ingress
+            fi
+            if [ -f /etc/netcontrol/owns_ingress ]; then
+                tc filter replace dev "$LAN_DEV" parent ffff: protocol all prio 10 matchall action mirred egress redirect dev "$IFB" 2>/dev/null
+            fi
+        fi
+    else
+        log "检测到 $LAN_DEV 已有 ingress qdisc，出于安全不覆盖；上传限速跳过"
+    fi
+
+    _id=10
+    for sec in $(sections); do
+        [ "$(uci -q get "$CFG.$sec.enabled")" = 1 ] || continue
+        _ip="$(uci -q get "$CFG.$sec.ip")"
+        valid_ip "$_ip" || continue
+        _dl="$(uci -q get "$CFG.$sec.download_kbit")"; _ul="$(uci -q get "$CFG.$sec.upload_kbit")"
+        case "$_dl" in ''|*[!0-9]*) _dl=0;; esac; case "$_ul" in ''|*[!0-9]*) _ul=0;; esac
+        if [ "$_dl" -gt 0 ] 2>/dev/null && [ -f /etc/netcontrol/owns_lan_root ]; then
+            tc class replace dev "$LAN_DEV" parent 1:1 classid "1:$_id" htb rate "${_dl}kbit" ceil "${_dl}kbit" 2>/dev/null
+            tc filter replace dev "$LAN_DEV" protocol ip parent 1: prio 10 u32 match ip dst "$_ip/32" flowid "1:$_id" 2>/dev/null
+        fi
+        if [ "$_ul" -gt 0 ] 2>/dev/null && [ -f /etc/netcontrol/owns_ingress ]; then
+            tc class replace dev "$IFB" parent 2:1 classid "2:$_id" htb rate "${_ul}kbit" ceil "${_ul}kbit" 2>/dev/null
+            tc filter replace dev "$IFB" protocol ip parent 2: prio 10 u32 match ip src "$_ip/32" flowid "2:$_id" 2>/dev/null
+        fi
+        _id=$((_id + 1))
+    done
+    printf '%s\n' "$_sig" > "$RATE_SIG"
+}
+
+apply_all() {
+    mkdir -p /etc/netcontrol "$STATE_DIR"
+    firewall_apply || log 'nftables 规则应用失败，请检查 nft/fw4'
+    rate_apply
+}
+
+status() {
+    echo "版本：0.1.0"
+    echo "LAN 设备：$LAN_DEV"
+    echo "nftables 独立表：$(nft list table inet netcontrol >/dev/null 2>&1 && echo 已创建 || echo 未创建)"
+    echo "限速：$(command -v tc >/dev/null 2>&1 && echo 'tc 可用（若检测到既有 QoS 队列会跳过，避免覆盖）' || echo '未检测到 tc')"
+    for sec in $(sections); do
+        name="$(uci -q get "$CFG.$sec.name")"; en="$(uci -q get "$CFG.$sec.enabled")"; mac="$(uci -q get "$CFG.$sec.mac")"
+        echo "$name [$sec] enabled=$en MAC=$mac"
+        if blocked_now "$sec"; then echo '  当前状态：断网（时段外或休息中）'; else echo '  当前状态：允许联网'; fi
+    done
+}
+
+stop_all() {
+    nft delete table inet netcontrol 2>/dev/null
+    cleanup_rates
+}
+
+case "$1" in
+    apply) apply_all ;;
+    stop) stop_all ;;
+    status) status ;;
+    daemon)
+        trap 'exit 0' INT TERM
+        while :; do
+            apply_all
+            sleep 60
+        done
+        ;;
+    *) echo "用法：$0 {apply|status|stop|daemon}"; exit 2 ;;
+esac
