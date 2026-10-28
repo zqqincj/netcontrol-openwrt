@@ -1,0 +1,49 @@
+
+name: Build NetControl APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang flex bison g++ gawk gettext git libncurses-dev libssl-dev python3 python3-setuptools rsync swig time unzip zstd
+
+      - name: Download OpenWrt SDK
+        run: |
+          URL="https://downloads.openwrt.org/releases/25.12.5/targets/mediatek/filogic/"
+          FILE="openwrt-sdk-25.12.5-mediatek-filogic_gcc-14.3.0_musl.Linux-x86_64.tar.zst"
+          curl -fL "$URL$FILE" -o "/tmp/$FILE"
+          curl -fL "${URL}sha256sums" -o /tmp/sha256sums
+          grep "$FILE" /tmp/sha256sums | sed 's#  \+#  #' > /tmp/checksum.txt
+          cd /tmp
+          sha256sum -c checksum.txt
+          mkdir sdk
+          tar --zstd -xf "$FILE" -C sdk --strip-components=1
+          echo "SDK=$PWD/sdk" >> "$GITHUB_ENV"
+
+      - name: Build package
+        run: |
+          mkdir -p "$SDK/package/luci-app-netcontrol"
+          cp -a "$GITHUB_WORKSPACE/." "$SDK/package/luci-app-netcontrol/"
+          cd "$SDK"
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          make defconfig
+          make package/luci-app-netcontrol/compile V=s
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: netcontrol-apk
+          path: /tmp/sdk/bin/packages/**/*.apk
+          if-no-files-found: error
